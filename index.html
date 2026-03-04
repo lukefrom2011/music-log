@@ -275,10 +275,14 @@
 // ─────────────────────────────────────────────
 // CONFIGURATION — replace with your Supabase project values
 // ─────────────────────────────────────────────
-const SUPABASE_URL = 'https://gfzzemjcaqsuufjukkvv.supabase.co';
-const SUPABASE_ANON_KEY = 'sb_publishable_2fgxRvmKYZzii2jtuyRX2w_wbOZ9QbI';
+const SUPABASE_URL = 'YOUR_SUPABASE_URL';
+const SUPABASE_ANON_KEY = 'YOUR_SUPABASE_ANON_KEY';
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+// Only this email sees the pre-loaded seed album history.
+// Other accounts start with a clean list and can add their own.
+const SEED_OWNER_EMAIL = 'lukeswansontucb@gmail.com';
 
 const SEED_DATA = [
   {id:"seed-0",album:"New Threats From The Soul",artist:"Ryan Davis",date:"2025-07-25",favorite_song:"Crass Shadows (at Walden Pawn)",score:87.1,detail:{tracks:[{song:"New Threats from the Soul",rating:7,modifier:null},{song:"Monte Carlo / No Limits",rating:7,modifier:null},{song:"Mutilation Springs",rating:7,modifier:null},{song:"Better If You Make Me",rating:8,modifier:null},{song:"The Simple Joy",rating:8,modifier:null},{song:"Mutilation Falls",rating:7,modifier:null},{song:"Crass Shadows (at Walden Pawn)",rating:8,modifier:null}],weighted_avg:7.429,takeaway:10,total:87.14}},
@@ -485,11 +489,13 @@ async function getActiveData() {
     loadUserEntries(), loadArtCache(), loadManualArt(), loadOverrides()
   ]);
 
-  const seeded = SEED_DATA.map(a => {
+  // Seed albums are only visible to the designated owner account
+  const isOwner = currentUser && currentUser.email === SEED_OWNER_EMAIL;
+  const seeded = isOwner ? SEED_DATA.map(a => {
     const art = manualArt[a.id] || artCache[a.id] || null;
     const ov = overrides[a.id] || null;
     return ov ? { ...a, art_url: art, ...ov } : { ...a, art_url: art };
-  });
+  }) : [];
 
   const users = userEntries.map(a => ({
     ...a, art_url: manualArt[a.id] || a.art_url || null,
@@ -728,14 +734,20 @@ function renderSignupForm() {
     if (pass.length < 6) { msg.innerHTML = `<div class="auth-error">Password must be at least 6 characters.</div>`; return; }
     if (pass !== confirm) { msg.innerHTML = `<div class="auth-error">Passwords don't match.</div>`; return; }
     btn.disabled = true; btn.textContent = 'Creating account…';
-    const { error } = await sb.auth.signUp({ email, password: pass });
+    const { data: signUpData, error } = await sb.auth.signUp({ email, password: pass });
     if (error) {
       msg.innerHTML = `<div class="auth-error">${escHtml(error.message)}</div>`;
       btn.disabled = false; btn.textContent = 'Create Account';
-    } else {
-      msg.innerHTML = `<div class="auth-success">Account created! Check your email to confirm, then sign in.</div>`;
-      btn.disabled = true;
+      return;
     }
+    // If Supabase returned a session, user is already logged in (email confirm disabled)
+    if (signUpData.session) return; // onAuthStateChange handles the rest
+    // Otherwise try immediate sign-in (works when email confirm is disabled)
+    const { error: loginErr } = await sb.auth.signInWithPassword({ email, password: pass });
+    if (!loginErr) return; // onAuthStateChange handles the rest
+    // Fallback: email confirmation is still required
+    msg.innerHTML = `<div class="auth-success">Account created! Sign in with your credentials below.</div>`;
+    setTimeout(() => renderAuth('login'), 2000);
   });
 }
 
@@ -1009,7 +1021,10 @@ function renderDetail(album, allData) {
         <div class="detail-stats">
           <span class="stat-score">${album.score.toFixed(1)}</span>
           <span class="muted"> · RANK </span><span class="stat-val">#${rank}</span>
-          <span class="muted"> · RELEASED </span><span class="stat-val">${fmtDate(album.date)}</span>
+          <span class="muted"> · RELEASED </span>
+          <span class="stat-val detail-date-display" id="dateDisplay" title="Click to edit" style="cursor:pointer;border-bottom:1px dashed var(--divider)">${fmtDate(album.date)}</span>
+          <input type="date" id="dateEditInput" value="${album.date || ''}"
+            style="display:none;font-family:var(--font-mono);font-size:0.72rem;border:none;border-bottom:1.5px solid var(--accent);background:transparent;color:var(--text);outline:none;padding:2px 0;">
         </div>
         ${actionsHtml}
       </div>
@@ -1020,6 +1035,44 @@ function renderDetail(album, allData) {
     e.preventDefault();
     if (history.length > 1) history.back(); else navigate('#list');
   });
+
+  // Inline date editing
+  const dateDisplay = document.getElementById('dateDisplay');
+  const dateInput = document.getElementById('dateEditInput');
+  if (dateDisplay && dateInput) {
+    dateDisplay.addEventListener('click', () => {
+      dateDisplay.style.display = 'none';
+      dateInput.style.display = 'inline';
+      dateInput.focus();
+    });
+    const saveDate = async () => {
+      const newDate = dateInput.value || null;
+      dateDisplay.textContent = fmtDate(newDate);
+      dateDisplay.style.display = 'inline';
+      dateInput.style.display = 'none';
+      if (isUser && album._db_id) {
+        await sb.from('user_albums').update({ release_date: newDate }).eq('id', album._db_id);
+        const idx = (_cachedActiveData||[]).findIndex(a => a.id === album.id);
+        if (idx >= 0) _cachedActiveData[idx] = { ..._cachedActiveData[idx], date: newDate };
+      } else if (isSeed) {
+        // Save as part of override (merge with existing override or create minimal one)
+        const existing = (_cachedActiveData||[]).find(a => a.id === album.id);
+        const ov = {
+          score: existing ? existing.score : album.score,
+          favorite_song: existing ? existing.favorite_song : album.favorite_song,
+          date: newDate,
+          detail: existing ? existing.detail : album.detail,
+        };
+        await saveOverride(album.id, ov);
+        if (_cachedActiveData) {
+          const idx = _cachedActiveData.findIndex(a => a.id === album.id);
+          if (idx >= 0) _cachedActiveData[idx] = { ..._cachedActiveData[idx], date: newDate };
+        }
+      }
+    };
+    dateInput.addEventListener('blur', saveDate);
+    dateInput.addEventListener('keydown', e => { if (e.key === 'Enter') dateInput.blur(); if (e.key === 'Escape') { dateInput.style.display='none'; dateDisplay.style.display='inline'; } });
+  }
 
   document.getElementById('artUploadBtn').addEventListener('click', () => document.getElementById('artUploadInput').click());
   document.getElementById('artUploadInput').addEventListener('change', async e => {
