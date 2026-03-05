@@ -1556,21 +1556,73 @@ function _refreshLiveScore() {
 // ─────────────────────────────────────────────
 // BOOTSTRAP
 // ─────────────────────────────────────────────
+
+// Track whether we've done the first render so onAuthStateChange
+// doesn't double-render on subsequent token refreshes.
+let _initialRenderDone = false;
+
 sb.auth.onAuthStateChange(async (event, session) => {
   currentUser = session?.user ?? null;
   _cachedActiveData = null;
 
   if (event === 'PASSWORD_RECOVERY') {
     renderPasswordReset();
+    _initialRenderDone = true;
     return;
   }
 
-  if (currentUser) {
-    await render();
-  } else {
+  // SIGNED_OUT while app is running → go back to auth screen
+  if (event === 'SIGNED_OUT') {
+    _initialRenderDone = true;
     renderAuth();
+    return;
+  }
+
+  // For subsequent auth events (TOKEN_REFRESHED, USER_UPDATED etc.)
+  // only re-render if we haven't done the initial render yet, or if
+  // it's an explicit sign-in / sign-up event.
+  const shouldRender = !_initialRenderDone
+    || event === 'SIGNED_IN'
+    || event === 'USER_UPDATED';
+
+  if (shouldRender) {
+    _initialRenderDone = true;
+    if (currentUser) {
+      await render();
+    } else {
+      renderAuth();
+    }
   }
 });
+
+// Explicit initial session check — runs as soon as the script executes.
+// This is the primary entry point. onAuthStateChange is a backup for
+// subsequent events (sign-in, sign-out, token refresh).
+(async () => {
+  try {
+    const { data: { session } } = await sb.auth.getSession();
+    currentUser = session?.user ?? null;
+    _initialRenderDone = true;
+    if (currentUser) {
+      await render();
+    } else {
+      renderAuth();
+    }
+  } catch (err) {
+    console.error('Bootstrap error:', err);
+    // Supabase credentials may be wrong — show a clear error instead of spinning
+    app.innerHTML = `
+      <div class="auth-wrap">
+        <div class="auth-card">
+          <div class="auth-logo">Album Ratings</div>
+          <div class="auth-tagline" style="color:var(--red);margin-bottom:0">
+            Could not connect to the database.<br>
+            Check that SUPABASE_URL and SUPABASE_ANON_KEY are set correctly in the HTML file.
+          </div>
+        </div>
+      </div>`;
+  }
+})();
 
 function renderPasswordReset() {
   app.innerHTML = `
